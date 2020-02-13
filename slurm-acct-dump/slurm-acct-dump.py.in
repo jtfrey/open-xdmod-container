@@ -1,0 +1,451 @@
+#!/usr/bin/env python
+#
+# slurm-acct-dump.py
+#
+# Use dtrmgr to dump the next <N> chunks of accounting data and move into
+# place for XDMod to ingest.
+#
+
+import os
+import re
+import sys
+import errno
+import atexit
+import time
+import argparse
+import subprocess
+import logging
+
+PREFIX_DIR = '@CMAKE_INSTALL_PREFIX@'
+BIN_DIR = os.path.join(PREFIX_DIR, '@CMAKE_INSTALL_BINDIR@')
+SYSCONF_DIR = os.path.join(PREFIX_DIR, '@CMAKE_INSTALL_SYSCONFDIR@')
+DEFAULT_WORK_DIR = os.path.join(PREFIX_DIR, 'work')
+
+DEFAULT_CONFIG_FILE = os.path.join(SYSCONF_DIR, 'slurm-acct-dump.conf')
+DEFAULT_PID_FILE = os.path.join(PREFIX_DIR, 'run', 'slurm-acct-dump.pid')
+DTRMGR = os.path.join(BIN_DIR, 'dtrmgr')
+SACCT = os.path.join(BIN_DIR, 'sacct')
+
+##
+
+class duration(object):
+
+    fixedRegex = re.compile(r'^\s*((\d+)-)?(((\d{2}):)?(\d{2}):)?(\d{2})\s*$')
+    symbolicRegex = re.compile(r'^\s*(\d+)(weeks?|w|days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(.*)$', re.IGNORECASE)
+    multipliers = {
+                    'weeks':604800, 'week':604800, 'wk':604800, 'w':604800,
+                    'days':86400, 'day':86400, 'd':86400,
+                    'hours':3600, 'hour':3600, 'hrs':3600, 'hr':3600, 'h':3600,
+                    'minutes':60, 'minute':60, 'mins':60, 'min':60, 'm':60,
+                    'seconds':1, 'second':1, 'secs':1, 'sec':1, 's':1
+                  }
+
+    def __init__(self, timeStr):
+        try:
+            self.seconds = int(timeStr)
+        except:
+            self.seconds = 0
+            part = duration.symbolicRegex.match(timeStr)
+            if part is not None:
+                searchStr = timeStr
+                while part is not None:
+                    unit = part.group(2).lower()
+                    self.seconds = self.seconds + int(part.group(1)) * duration.multipliers[unit]
+                    searchStr = part.group(3)
+                    part = duration.symbolicRegex.match(searchStr)
+                if searchStr:
+                    raise ValueError('unrecognized remainder of duration string: {}'.format(searchStr))
+            else:
+                part = duration.fixedRegex.match(timeStr)
+                if part is not None:
+                    if part.group(2):
+                        self.seconds = self.seconds + 86400 * int(part.group(2))
+                    if part.group(5):
+                        self.seconds = self.seconds + 3600 * int(part.group(5)) + 60 * int(part.group(6)) + int(part.group(7))
+                    elif part.group(6):
+                        self.seconds = self.seconds + 3600 * int(part.group(6)) + 60 * int(part.group(7))
+                    else:
+                        self.seconds = self.seconds + 3600 * int(part.group(7))
+                else:
+                    raise ValueError('unrecognized duration string: {}'.format(timeStr))
+
+    def __str__(self):
+        s = self.seconds
+        S = ''
+        if s >= 604800:
+            v = int(s / 604800)
+            S = S + '{:d}w'.format(v)
+            s = s - (v * 604800)
+        if s >= 86400:
+            v = int(s / 86400)
+            S = S + '{:d}d'.format(v)
+            s = s - (v * 86400)
+        if s >= 3600:
+            v = int(s / 3600)
+            S = S + '{:d}h'.format(v)
+            s = s - (v * 3600)
+        if s >= 60:
+            v = int(s / 60)
+            S = S + '{:d}m'.format(v)
+            s = s - (v * 60)
+        if s > 0:
+            S = S + '{:d}s'.format(s)
+        return S
+
+    def __repr__(self):
+        return 'duration("{}")'.format(str(self))
+
+##
+
+class execCmd(object):
+
+    def __init__(self, argv, input=None, output=None):
+        try:
+            args = {    'stdin': (subprocess.PIPE if input is None else input),
+                        'stdout': (subprocess.PIPE if (output is None) else output),
+                        'stderr': subprocess.PIPE,
+                        'close_fds': True
+                }
+            logging.debug('executing command: %s', ' '.join(argv))
+            theProcess = subprocess.Popen(argv, **args)
+            (self.stdout, self.stderr) = theProcess.communicate(input=input)
+            self.returncode = theProcess.returncode
+            logging.debug('  rc=%d', self.returncode)
+            self.exception = False
+        except Exception as E:
+            self.stdout = None
+            self.stderr = None
+            self.returncode = -1
+            self.exception = E
+
+    def errorLines(self):
+        outStr = ['rc={:d}'.format(self.returncode)]
+        if self.stderr:
+            outStr.extend(self.stderr.splitlines())
+        if self.exception:
+            outStr.append(str(self.exception))
+        return outStr
+
+    def isReturnCodeOkay(self, okay_code=0):
+        if self.exception: return False
+        return (self.returncode == okay_code)
+
+##
+
+cliParser = argparse.ArgumentParser(description='Dump Slurm accounting data for XDMod ingest')
+cliParser.add_argument(
+                '--verbose', '-v',
+                dest='verbosity',
+                action='count',
+                default=0,
+                help='increase the amount of logging produced by the program'
+            )
+cliParser.add_argument(
+                '--quiet', '-q',
+                dest='quietness',
+                action='count',
+                default=0,
+                help='descrease the amount of logging produced by the program'
+            )
+cliParser.add_argument(
+                '--output-as-log',
+                dest='shouldShowLoggingOutput',
+                action='store_true',
+                default=False
+            )
+cliParser.add_argument(
+                '--config', '-c', metavar='<file>',
+                dest='configFile',
+                help='use a specific YAML configuration file rather than the default ({})'.format(DEFAULT_CONFIG_FILE)
+            )
+cliParser.add_argument(
+                '--pid-file', '-P', metavar='<file>',
+                dest='pidFile',
+                help='use a specific file to run/not run (default: {})'.format(DEFAULT_PID_FILE)
+            )
+cliParser.add_argument(
+                '--max-time-ranges', '-m', metavar='<int>',
+                dest='maxTimeRanges',
+                type=int,
+                help='generate no more than <int> accounting dump files'
+            )
+cliParser.add_argument(
+                '--time-range-period', '-p', metavar='<duration>',
+                dest='timeRangePeriod',
+                help='allocate scheduled periods that are no longer than <duration>; valid formats are S, D-HH, D-HH:MM, D-HH:MM:SS, or a symbolic string of integers and units (e.g. 1w2d4h5m6s)'
+            )
+cliParser.add_argument(
+                '--work-dir', '-w', metavar='<directory>',
+                dest='workDir',
+                help='dump accounting files to this directory (default: {})'.format(DEFAULT_WORK_DIR)
+            )
+cliParser.add_argument(
+                '--ingest-dir', '-I', metavar='<directory>',
+                dest='ingestDir',
+                help='copy dumped accounting files to this directory for XDMod ingest (if not set then the files are left in the --work-dir)'
+            )
+cliParser.add_argument(
+                '--no-checkout', '-C',
+                dest='shouldDoDatabaseCheckout',
+                action='store_false',
+                default=True
+            )
+cliParser.add_argument(
+                '--no-ingest', '-N',
+                dest='shouldDoIngest',
+                action='store_false',
+                default=True
+            )
+cliParser.add_argument(
+                '--dtrmgr', metavar='<file>',
+                dest='dtrmgr',
+                help='the dtrmgr command, probably as a full path'
+            )
+cliParser.add_argument(
+                '--dtrmgr-database', '-D', metavar='<file>',
+                dest='dtrmgrDatabase',
+                help='the dtrmgr database file that holds the dump schedule'
+            )
+cliParser.add_argument(
+                '--sacct', metavar='<file>',
+                dest='sacct',
+                help='the sacct command, probably as a full path'
+            )
+cliArgs = cliParser.parse_args()
+
+#
+# Augment the program verbosity:
+#
+logLevels = [logging.CRITICAL, logging.ERROR, logging.WARN, logging.INFO, logging.DEBUG]
+logLevel = 1 + cliArgs.verbosity - cliArgs.quietness
+if logLevel < 0: logLevel = 0
+if logLevel >= len(logLevels): logLevel = len(logLevels) - 1
+logFormat = '%(asctime)s [%(levelname)-8s] %(message)s' if cliArgs.shouldShowLoggingOutput else '%(levelname)s: %(message)s'
+logging.basicConfig(format=logFormat, datefmt='%Y-%m-%dT%H:%M:%S', level=logLevels[logLevel])
+
+#
+# Here's our default config; it may get overridden by a config file
+# or by CLI arguments:
+#
+config = {
+            'pidFile' : DEFAULT_PID_FILE,
+            'maxTimeRanges': 5,
+            'timeRangePeriod': '12h',
+            'workDir' : DEFAULT_WORK_DIR,
+            'ingestDir' : None,
+            'dtrmgrDatabase' : None,
+            'dtrmgr': DTRMGR,
+            'sacct': SACCT
+        }
+if cliArgs.configFile is None and os.path.isfile(DEFAULT_CONFIG_FILE):
+    cliArgs.configFile = DEFAULT_CONFIG_FILE
+if cliArgs.configFile is not None:
+    if os.path.isfile(cliArgs.configFile):
+        from yaml import load as yamlLoad
+        try:
+            from yaml import CLoader as YAMLLoader
+        except ImportError:
+            from yaml import Loader as YAMLLoader
+        try:
+            #
+            # Try to parse the configuration file; it should return a dictionary
+            # of key-value pairs.
+            #
+            with file(cliArgs.configFile, 'r') as confFile:
+                mergeConfig = yamlLoad(confFile, Loader=YAMLLoader)
+                config.update(mergeConfig)
+        except Exception as E:
+            logging.error('unable to read config file %s: %s', cliArgs.configFile, str(E))
+            exit(errno.EINVAL)
+    else:
+        logging.error('config file not present: %s', cliArgs.configFile)
+        exit(errno.ENOENT)
+
+#
+# Override config with CLI arguments:
+#
+if cliArgs.maxTimeRanges is not None:
+    config['maxTimeRanges'] = cliArgs.maxTimeRanges
+if cliArgs.timeRangePeriod is not None:
+    config['timeRangePeriod'] = cliArgs.timeRangePeriod
+if cliArgs.workDir is not None:
+    config['workDir'] = cliArgs.workDir
+if cliArgs.ingestDir is not None:
+    config['ingestDir'] = cliArgs.ingestDir
+if cliArgs.pidFile is not None:
+    config['pidFile'] = cliArgs.pidFile
+if cliArgs.dtrmgrDatabase is not None:
+    config['dtrmgrDatabase'] = cliArgs.dtrmgrDatabase
+if cliArgs.dtrmgr is not None:
+    config['dtrmgr'] = cliArgs.dtrmgr
+if cliArgs.sacct is not None:
+    config['sacct'] = cliArgs.sacct
+
+#
+# If our PID file exists, exit now:
+#
+if os.path.exists(config['pidFile']):
+    try:
+        with open(config['pidFile'], 'r') as pidFPtr:
+            otherPid = int(pidFPtr.read())
+    except Exception as E:
+        logging.critical('unable to read extant PID file %s', config['pidFile'])
+        exit(errno.EACCES)
+
+    try:
+        os.kill(otherPid, 0)
+        logging.critical('the PID in %s exists and is probably another instance already running', config['pidFile'])
+        exit(errno.EAGAIN)
+    except Exception as E:
+        os.remove(config['pidFile'])
+try:
+    #
+    # Get our PID file opened:
+    #
+    pidFPtr = open(config['pidFile'], 'w')
+    pidFPtr.write('{:d}'.format(os.getpid()))
+    pidFPtr.flush()
+
+    def closePidFile():
+        try:
+            os.remove(config['pidFile'])
+        except:
+            pass
+        if pidFPtr:
+            pidFPtr.close();
+
+    atexit.register(closePidFile)
+except Exception as E:
+    logging.critical('unable to create PID file %s: %s', config['pidFile'], str(E))
+    exit(errno.EPERM)
+
+#
+# Convert config elements that need conversion:
+#
+config['maxTimeRanges'] = int(config['maxTimeRanges'])
+config['timeRangePeriod'] = duration(config['timeRangePeriod'])
+
+#
+# Do we have a dtrmgr database?
+#
+if config['dtrmgrDatabase'] is None:
+    logging.error('a dtrmgr database file must be specified using --dtrmgr-database/-D')
+    exit(errno.EINVAL)
+if not os.path.exists(config['dtrmgrDatabase']):
+    logging.error('no dtrmgr database file at %s', config['dtrmgrDatabase'])
+    exit(errno.EINVAL)
+
+#
+# Check that we can write to the work and ingest directories:
+#
+if not os.path.exists(config['workDir']):
+    logging.error('work directory does not exist: %s', config['workDir'])
+    exit(errno.ENOENT)
+if not os.path.isdir(config['workDir']):
+    logging.error('work directory exists but is not a directory: %s', config['workDir'])
+    exit(errno.EINVAL)
+if not os.access(config['workDir'], os.W_OK | os.X_OK):
+    logging.error('no permission to write to work directory: %s', config['workDir'])
+    exit(errno.EPERM)
+logging.info('using work directory: %s', config['workDir'])
+#
+if cliArgs.shouldDoDatabaseCheckout and cliArgs.shouldDoIngest:
+    if config['ingestDir'] is not None:
+        if not os.path.exists(config['ingestDir']):
+            logging.error('ingest directory does not exist: %s', config['ingestDir'])
+            exit(errno.ENOENT)
+        if not os.path.isdir(config['ingestDir']):
+            logging.error('ingest directory exists but is not a directory: %s', config['ingestDir'])
+            exit(errno.EINVAL)
+        if not os.access(config['ingestDir'], os.W_OK | os.X_OK):
+            logging.error('no permission to write to ingest directory: %s', config['ingestDir'])
+            exit(errno.EPERM)
+        logging.info('using ingest directory: %s', config['ingestDir'])
+    else:
+        logging.error('no ingest directory specified')
+        exit(errno.EINVAL)
+
+#
+# Dump config to the log:
+#
+logging.debug('using configuration:')
+for (k,v) in config.iteritems():
+    logging.debug('  %s = %s', k, v)
+
+#
+# Ready to do some work!
+#
+numDumped = 0
+dtrRegex = re.compile(r'^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})([+-]\d{4}):(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})([+-]\d{4})$')
+
+#
+# Grab the next <N> time ranges:
+#
+nextTimeRangesCmd = execCmd([config['dtrmgr'], '--load=' + config['dtrmgrDatabase'],
+                             '--duration={:d}'.format(config['timeRangePeriod'].seconds),
+                             '--next={:d}'.format(config['maxTimeRanges'])
+                            ])
+if not nextTimeRangesCmd.isReturnCodeOkay():
+    logging.error('dtrmgr command failed during time ranges lookup')
+    for errLine in nextTimeRangesCmd.errorLines():
+        logging.info('  ' + errLine)
+    exit(errno.EINVAL)
+nextTimeRanges = nextTimeRangesCmd.stdout.splitlines()
+del nextTimeRangesCmd
+
+#
+# Process the time ranges:
+#
+moveToIngest = []
+for nextTS in nextTimeRanges:
+    m = dtrRegex.match(nextTS)
+    if m is not None:
+        startTime = '{:s}-{:s}-{:s}T{:s}:{:s}:{:s}'.format(*(m.groups()[:6]))
+        endTime = '{:s}-{:s}-{:s}T{:s}:{:s}:{:s}'.format(*(m.groups()[7:13]))
+        outputFile = os.path.join(config['workDir'], m.group(0) + '.dump')
+        if not os.path.exists(outputFile):
+            with open(outputFile, 'w') as outFPtr:
+                dumpCmd = execCmd([config['sacct'], '--allusers', '--parsable2', '--noheader', '--allocations', '--duplicates',
+                                    '--format', 'jobid,jobidraw,cluster,partition,account,group,gid,user,uid,submit,eligible,start,end,elapsed,exitcode,state,nnodes,ncpus,reqcpus,reqmem,reqgres,reqtres,timelimit,nodelist,jobname',
+                                    '--state', 'CANCELLED,COMPLETED,FAILED,NODE_FAIL,PREEMPTED,TIMEOUT',
+                                    '--starttime', startTime, '--endtime', endTime],
+                                output=outFPtr
+                            )
+                if not dumpCmd.isReturnCodeOkay():
+                    os.remove(outputFile)
+                    logging.error('failed while dumping log data %s', m.group(0))
+                    for errLine in dumpCmd.errorLines():
+                        logging.info('  ' + errLine)
+                    exit(1)
+            logging.info('successful dump of log data %s', m.group(0))
+            
+            if cliArgs.shouldDoDatabaseCheckout:
+                # Mark the block of time in the database:
+                markCmd = execCmd([config['dtrmgr'], '--load=' + config['dtrmgrDatabase'],
+                                    '--add-range=' + m.group(0), '--save'])
+                if not markCmd.isReturnCodeOkay():
+                    os.remove(outputFile)
+                    logging.error('dtrmgr command failed during time range checkout')
+                    for errLine in nextTimeRangesCmd.errorLines():
+                        logging.info('  ' + errLine)
+                    exit(errno.EINVAL)
+                logging.info('successful checkout of %s in database', m.group(0))
+            
+                if cliArgs.shouldDoIngest:
+                    ingestFile = os.path.join(config['ingestDir'], os.path.basename(outputFile))
+                    moveToIngest.append((outputFile, ingestFile))
+
+#
+# Move stuff to ingest queue when necessary:
+#
+for (outputFile, ingestFile) in moveToIngest:
+    # Attempt a rename:
+    try:
+        os.rename(outputFile, ingestFile)
+        logging.info('successful move of %s => %s', outputFile, ingestFile)
+        numDumped = numDumped + 1
+    except Exception as E:
+        logging.error('failed to move %s => %s', outputFile, ingestFile)
+        logging.error('  %s', str(E))
+        exit(1)
+
