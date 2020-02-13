@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=forking
-PIDFile=@CMAKE_INSTALL_PREFIX@/run/%i.pid
+PIDFile=@CMAKE_INSTALL_PREFIX@/var/run/%i.pid
 TimeoutStopSec=300s
 Restart=on-abnormal
 RestartSec=90s

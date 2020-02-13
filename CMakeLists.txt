@@ -14,3 +14,6 @@ ADD_SUBDIRECTORY(slurm-acct-dump)
 # The container pieces:
 ADD_SUBDIRECTORY(container)
 
+# Make sure we have a run directory:
+INSTALL(DIRECTORY DESTINATION ${CMAKE_INSTALL_LOCALSTATEDIR}/run)
+

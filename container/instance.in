@@ -6,17 +6,30 @@
 POSITIONAL=()
 VERBOSE=0
 
-RUNDIR='@CMAKE_INSTALL_PREFIX@/run'
+PREFIX='@CMAKE_INSTALL_PREFIX@'
+
+if [ '@CMAKE_INSTALL_LOCALSTATEDIR@' = /* ]; then
+    RUNDIR='@CMAKE_INSTALL_LOCALSTATEDIR@/run'
+else
+    RUNDIR='@CMAKE_INSTALL_PREFIX@/@CMAKE_INSTALL_LOCALSTATEDIR@/run'
+fi
+mkdir -p "$RUNDIR"
+
+if [ '@CMAKE_INSTALL_SYSCONFDIR@' = /* ]; then
+    SINGIMG='@CMAKE_INSTALL_SYSCONFDIR@/XDMoD.sif'
+else
+    SINGIMG='@CMAKE_INSTALL_PREFIX@/@CMAKE_INSTALL_SYSCONFDIR@/XDMoD.sif'
+fi
 
 SINGPID=""
 
 SINGEXE='@SINGULARITY_EXE@'
 
-SINGIMG='@CMAKE_INSTALL_PREFIX@/simg/XDMoD.sif'
+SINGOPTS=(--net --dns @SINGULARITY_DNS_IPADDR@ --network bridge)
 
-SINGOPTS=(--net --dns @SINGULARITY_DNS_IPADDR@ --network bridge --network-args "portmap=@SINGULARITY_HTTP_OUTSIDE@:@SINGULARITY_HTTP_INSIDE@/tcp")
+HOSTPORT='@SINGULARITY_HTTP_OUTSIDE@'
 
-SINGOVERLAY_ROOT=/var/lib/xdmod/root
+SINGOVERLAY_ROOT='@CMAKE_INSTALL_PREFIX@/root'
 SINGOVERLAY="<template>"
 
 usage() {
@@ -39,6 +52,11 @@ usage:
                         defaults to:
 
                           ${SINGOVERLAY_ROOT}/<instance-name>
+
+    -p, --port <#>      map host port <#> to port @SINGULARITY_HTTP_INSIDE@
+                        in the container; defaults to:
+
+                          @SINGULARITY_HTTP_OUTSIDE@
 
   actions:
 
@@ -81,7 +99,7 @@ start() {
         echo "INFO:   instance '$1' is already running"
         return 254
     fi
-    OUTPUT="$("$SINGEXE" instance start --overlay "$SINGOVERLAY" "${SINGOPTS[@]}" "$SINGIMG" "XDMoD-$1" 2>&1)"
+    OUTPUT="$("$SINGEXE" instance start --overlay "$SINGOVERLAY" "${SINGOPTS[@]}" --network-args "portmap=${HOSTPORT}:@SINGULARITY_HTTP_INSIDE@/tcp" "$SINGIMG" "XDMoD-$1" 2>&1)"
     rc=$?
     if [ $VERBOSE -ne 0 ]; then
         if [ $rc -ne 0 ]; then
@@ -175,6 +193,22 @@ while [ $# -gt 0 ]; do
                 exit 22
             fi
             SINGOVERLAY="${BASH_REMATCH[1]}"
+            ;;
+
+        -p|--port)
+            shift
+            if [[ -z "$1" || ! "$1" =~ ^[0-9]+$ ]; then
+                echo "ERROR:  no port number provided with -p/--port option"
+                exit 22
+            fi
+            HOSTPORT="$1"
+            ;;
+        --port=*)
+            if [[ ! "$1" =~ ^--port=([0-9]+)$ ]]; then
+                echo "ERROR:  no port number provided with -p/--port option"
+                exit 22
+            fi
+            HOSTPORT="${BASH_REMATCH[1]}"
             ;;
 
         -*)

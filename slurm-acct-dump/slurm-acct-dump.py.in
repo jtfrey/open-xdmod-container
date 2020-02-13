@@ -17,8 +17,14 @@ import subprocess
 import logging
 
 PREFIX_DIR = '@CMAKE_INSTALL_PREFIX@'
-BIN_DIR = os.path.join(PREFIX_DIR, '@CMAKE_INSTALL_BINDIR@')
-SYSCONF_DIR = os.path.join(PREFIX_DIR, '@CMAKE_INSTALL_SYSCONFDIR@')
+if os.path.isabs('@CMAKE_INSTALL_BINDIR@'):
+    BIN_DIR = '@CMAKE_INSTALL_BINDIR@'
+else:
+    BIN_DIR = os.path.join(PREFIX_DIR, '@CMAKE_INSTALL_BINDIR@')
+if os.path.isabs('@CMAKE_INSTALL_SYSCONFDIR@'):
+    SYSCONF_DIR = '@CMAKE_INSTALL_SYSCONFDIR@'
+else:
+    SYSCONF_DIR = os.path.join(PREFIX_DIR, '@CMAKE_INSTALL_SYSCONFDIR@')
 DEFAULT_WORK_DIR = os.path.join(PREFIX_DIR, 'work')
 
 DEFAULT_CONFIG_FILE = os.path.join(SYSCONF_DIR, 'slurm-acct-dump.conf')
