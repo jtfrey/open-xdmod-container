@@ -22,7 +22,12 @@ CONFIGURE_FILE(Singularity/xdmod.service.in xdmod.service @ONLY)
 
 # If the singularity command was present, we can try to build the container image:
 IF (SINGULARITY_EXE)
-    MESSAGE("Build the image with ${SINGULARITY_EXE}")
+    # Build the Singularity container:
+    ADD_CUSTOM_TARGET(XDMod.sif ALL ${SINGULARITY_EXE} build XDMod.sif Singularity
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Singularity
+            COMMENT "Building Singularity container..."
+            DEPENDS XDMod.sif
+        )
 ELSE ()
     MESSAGE("The 'singularity' command could not be found, so you will need to build the container image manually.")
 ENDIF ()
@@ -30,3 +35,4 @@ ENDIF ()
 # Install:
 INSTALL(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/instance DESTINATION ${CMAKE_INSTALL_SBINDIR})
 INSTALL(FILES ${CMAKE_CURRENT_BINARY_DIR}/xdmod.service DESTINATION /etc/systemd/system)
+
